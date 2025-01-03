@@ -81,6 +81,8 @@ have_ga = get_option('guest_agent') \
 have_block = have_system or have_tools
 
 python = import('python').find_installation()
+cmake = import('cmake')
+cmake_macos_arch = host_machine.cpu() == 'aarch64' ? 'arm64' : host_machine.cpu()
 
 if cpu not in supported_cpus
   host_arch = 'unknown'
@@ -388,7 +390,14 @@ have_vhost_net = have_vhost_net_kernel or have_vhost_net_user or have_vhost_net_
 
 # Target-specific libraries and flags
 libm = cc.find_library('m', required: false)
-threads = dependency('threads')
+
+if targetos == 'windows'
+  threads = declare_dependency()
+  meson.override_dependency('threads', threads)
+else
+  threads = dependency('threads')
+endif
+
 util = cc.find_library('util', required: false)
 winmm = []
 socket = []
@@ -408,6 +417,7 @@ if targetos == 'windows'
   pathcch = cc.find_library('pathcch')
   socket = cc.find_library('ws2_32')
   winmm = cc.find_library('winmm')
+  crypt32 = cc.find_library('crypt32')
 
   win = import('windows')
   version_res = win.compile_resources('version.rc',
@@ -1173,18 +1183,66 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
                               link_args: config_host['EPOXY_LIBS'].split() + opengl_libs)
 endif
 
+vulkan = not_found
+libglslang = not_found
+
+if targetos == 'windows'
+  vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
+  libglslang = declare_dependency(link_args: [
+        '-lglslang',
+        '-lMachineIndependent',
+        '-lGenericCodeGen',
+        '-lSPIRV',
+        '-lSPIRV-Tools',
+        '-lSPIRV-Tools-opt'
+      ])
+elif targetos == 'linux'
+  vulkan = dependency('vulkan')
+endif
+
+if vulkan.found()
+  if not libglslang.found()
+    # FIXME: Get spirv-tools to enable opt.
+    glslang_opts = cmake.subproject_options()
+    glslang_opts.add_cmake_defines({'ENABLE_OPT': false})
+    glslang_subpro = cmake.subproject('glslang', options: glslang_opts)
+    libglslang = declare_dependency(link_with: [
+          glslang_subpro.target('glslang'),
+          glslang_subpro.target('MachineIndependent'),
+          glslang_subpro.target('GenericCodeGen'),
+          glslang_subpro.target('SPIRV'),
+        ], include_directories: glslang_subpro.include_directories('glslang')
+      )
+  endif
+
+  volk_opts = cmake.subproject_options()
+  volk_opts.add_cmake_defines({'VOLK_STATIC_DEFINES': 'VK_NO_PROTOTYPES'})
+  if targetos == 'windows'
+    volk_opts.append_compile_args('c', '-DVK_USE_PLATFORM_WIN32_KHR=1')
+  endif
+  volk_subproj = cmake.subproject('volk', options: volk_opts)
+  volk = declare_dependency(compile_args: ['-DVK_NO_PROTOTYPES'],
+                            include_directories: volk_subproj.include_directories('volk'),
+                            link_with: volk_subproj.target('volk'),
+                            dependencies: vulkan)
+
+  spirv_reflect_opts = cmake.subproject_options()
+  spirv_reflect_opts.add_cmake_defines({'SPIRV_REFLECT_STATIC_LIB': 'ON'})
+  spirv_reflect_subproj = cmake.subproject('SPIRV-Reflect', options: spirv_reflect_opts)
+  spirv_reflect = declare_dependency(include_directories: spirv_reflect_subproj.include_directories('spirv-reflect-static'),
+                                     link_with: spirv_reflect_subproj.target('spirv-reflect-static'),
+                                     dependencies: vulkan)
+endif
+
+subdir('thirdparty')
+
+
 gbm = not_found
 if (have_system or have_tools) and (virgl.found() or opengl.found())
   gbm = dependency('gbm', method: 'pkg-config', required: false,
                    kwargs: static_kwargs)
 endif
 have_vhost_user_gpu = have_vhost_user_gpu and virgl.found() and opengl.found() and gbm.found()
-
-tomllib = static_library('tomlpp', sources: files('toml.cpp'),
-                         include_directories: 'tomlplusplus/include')
-toml = declare_dependency(compile_args: ['-DTOML_HEADER_ONLY=0'],
-                          include_directories: 'tomlplusplus/include',
-                          link_with: tomllib)
 
 genconfig = declare_dependency(include_directories: 'genconfig')
 
@@ -1924,6 +1982,7 @@ config_host_data.set('CONFIG_LINUX_IO_URING', linux_io_uring.found())
 config_host_data.set('CONFIG_LIBPMEM', libpmem.found())
 config_host_data.set('CONFIG_NUMA', numa.found())
 config_host_data.set('CONFIG_OPENGL', opengl.found())
+config_host_data.set('CONFIG_VULKAN', vulkan.found())
 config_host_data.set('CONFIG_PROFILER', get_option('profiler'))
 config_host_data.set('CONFIG_RBD', rbd.found())
 config_host_data.set('CONFIG_RDMA', rdma.found())
@@ -2836,6 +2895,12 @@ config_host_data.set('CONFIG_CAPSTONE', capstone.found())
 config_host_data.set('CONFIG_FDT', fdt.found())
 config_host_data.set('CONFIG_SLIRP', slirp.found())
 
+tomlplusplus_proj = subproject('tomlplusplus', default_options: ['default_library=static'])
+tomlplusplus = tomlplusplus_proj.get_variable('tomlplusplus_dep')
+
+xxhash_proj = subproject('xxhash', default_options: ['default_library=static'])
+xxhash = xxhash_proj.get_variable('xxhash_dep')
+
 #####################
 # Generated sources #
 #####################
@@ -3136,8 +3201,7 @@ util_ss.add_all(trace_ss)
 util_ss = util_ss.apply(config_all, strict: false)
 libqemuutil = static_library('qemuutil',
                              sources: util_ss.sources() + stub_ss.sources() + genh,
-                             include_directories: 'util/xxHash',
-                             dependencies: [util_ss.dependencies(), libm, threads, glib, socket, malloc, pixman])
+                             dependencies: [util_ss.dependencies(), libm, threads, glib, socket, malloc, pixman, xxhash])
 qemuutil = declare_dependency(link_with: libqemuutil,
                               sources: genh + version_res,
                               dependencies: [event_loop_base])
@@ -3188,7 +3252,7 @@ specific_ss.add(files('xemu-xbe.c', 'xemu-version.c'))
 
 common_ss.add(files('cpus-common.c'))
 
-common_ss.add(toml)
+common_ss.add(tomlplusplus)
 common_ss.add(genconfig)
 
 subdir('softmmu')
@@ -4047,6 +4111,7 @@ summary_info += {'U2F support':       u2f}
 summary_info += {'libusb':            libusb}
 summary_info += {'usb net redir':     usbredir}
 summary_info += {'OpenGL support (epoxy)': opengl}
+summary_info += {'Vulkan support':    vulkan}
 summary_info += {'GBM':               gbm}
 summary_info += {'libiscsi support':  libiscsi}
 summary_info += {'libnfs support':    libnfs}
