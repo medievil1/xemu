@@ -27,14 +27,19 @@
 
 #if defined(_WIN32)
 const char *version_host = "raw.githubusercontent.com";
-const char *version_uri = "/mborgerson/xemu/ppa-snapshot/XEMU_VERSION";
+const char *version_uri = "/xemu-project/xemu/ppa-snapshot/XEMU_VERSION";
 const char *download_host = "github.com";
-const char *download_uri = "/mborgerson/xemu/releases/latest/download/xemu-win-release.zip";
+#if defined(__x86_64__)
+const char *download_uri = "/xemu-project/xemu/releases/latest/download/xemu-win-x86_64-release.zip";
+#elif defined(__aarch64__)
+const char *download_uri = "/xemu-project/xemu/releases/latest/download/xemu-win-aarch64-release.zip";
+#else
+#error Unknown update path
+#endif
 #else
 FIXME
 #endif
 
-#define CPPHTTPLIB_OPENSSL_SUPPORT 1
 #include <httplib.h>
 
 #define DPRINTF(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__);
